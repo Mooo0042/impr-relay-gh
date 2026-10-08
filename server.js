@@ -9,7 +9,7 @@
  *   POST /music-upload  -> raw MP3 bytes + header "mc-uuid"  ->  {"url": "..."}  or  {"Error","Message"}
  *
  * Extra: GET /f/<id>.mp3 serves the stored file (proxying Discord's expiring CDN links).
- * Zero dependencies, needs Node 18+.
+ * Needs Node 20+. No dependencies, except @vercel/blob when DB_STORE=blob or STORAGE=blob.
  */
 
 const http = require('node:http');
@@ -20,15 +20,17 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 
-const VERSION = '1.0.0';
+const VERSION = '1.2.0';
 
 const cfg = {
   port: Number(process.env.PORT || 3009),
   publicUrl: process.env.PUBLIC_URL ? process.env.PUBLIC_URL.replace(/\/*$/, '/') : '',
   name: process.env.RELAY_NAME || 'IMPR Relay',
   maxFileSize: Number(process.env.MAX_FILE_SIZE || 8 * 1024 * 1024),
-  storage: (process.env.STORAGE || 'discord').toLowerCase(),
+  storage: (process.env.STORAGE || 'discord').toLowerCase(), // where the MP3s go
+  dbStore: (process.env.DB_STORE || 'file').toLowerCase(), // where files.json lives: file | blob
   webhook: (process.env.DISCORD_WEBHOOK_URL || '').split('?')[0].replace(/\/+$/, ''),
+  blobAccess: (process.env.BLOB_ACCESS || 'private').toLowerCase(), // must match the store's mode
   dataDir: path.resolve(process.env.DATA_DIR || './data'),
   rateLimit: Number(process.env.RATE_LIMIT_PER_HOUR || 20),
   retentionDays: Number(process.env.RETENTION_DAYS || 0),
@@ -49,28 +51,94 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 /* ------------------------------------------------------------------ db */
 
+// files.json maps file ids to where the MP3 lives. It is kept in memory and persisted either
+// on local disk (DB_STORE=file) or in Vercel Blob (DB_STORE=blob), which makes the relay stateless.
+const DB_BLOB_PATH = 'impr/files.json';
 let db = { files: {}, hashes: {} };
+let dbEtag = null; // blob only: ETag of the version we last read or wrote
+let lastReload = 0;
+
+const normalizeDb = (d) => ({ files: (d && d.files) || {}, hashes: (d && d.hashes) || {} });
+
+// All db reads/writes run one at a time so a reload can never swap the db out mid-write.
+let dbQueue = Promise.resolve();
+function enqueue(fn) {
+  const p = dbQueue.then(fn);
+  dbQueue = p.catch(() => {});
+  return p;
+}
 
 async function loadDb() {
-  await fsp.mkdir(filesDir, { recursive: true });
+  if (cfg.dbStore === 'blob') {
+    const { get } = await sdk();
+    const r = await get(DB_BLOB_PATH, { access: cfg.blobAccess, useCache: false });
+    if (r && r.stream) {
+      db = normalizeDb(await new Response(r.stream).json());
+      dbEtag = (r.blob && r.blob.etag) || null;
+    } else {
+      db = normalizeDb(null); // first start, nothing stored yet
+      dbEtag = null;
+    }
+    lastReload = Date.now();
+    return;
+  }
   try {
-    db = JSON.parse(await fsp.readFile(dbFile, 'utf8'));
-    db.files ||= {};
-    db.hashes ||= {};
-  } catch {
-    /* first start */
+    db = normalizeDb(JSON.parse(await fsp.readFile(dbFile, 'utf8')));
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e; // never silently start with an empty db over a broken one
   }
 }
 
-let saving = Promise.resolve();
-function saveDb() {
-  // serialize writes, write atomically
-  saving = saving.then(async () => {
-    const tmp = dbFile + '.tmp';
-    await fsp.writeFile(tmp, JSON.stringify(db));
-    await fsp.rename(tmp, dbFile);
+async function writeDb() {
+  const body = JSON.stringify(db); // snapshot before any await
+  if (cfg.dbStore === 'blob') {
+    const { put } = await sdk();
+    const opts = { access: cfg.blobAccess, contentType: 'application/json', addRandomSuffix: false, cacheControlMaxAge: 60 };
+    if (dbEtag) opts.ifMatch = dbEtag; // only overwrite the version we read
+    else opts.allowOverwrite = false; // first write must not clobber an existing file
+    const res = await put(DB_BLOB_PATH, body, opts);
+    dbEtag = res.etag || null;
+    return;
+  }
+  const tmp = dbFile + '.tmp';
+  await fsp.writeFile(tmp, body);
+  await fsp.rename(tmp, dbFile);
+}
+
+// Apply `fn` to the db and persist it. With Blob, a lost race (another instance wrote first)
+// reloads the latest version and re-applies `fn` on top of it, so no entry is lost.
+function mutateDb(fn) {
+  return enqueue(async () => {
+    for (let attempt = 0; ; attempt++) {
+      fn(db);
+      try {
+        return await writeDb();
+      } catch (e) {
+        if (cfg.dbStore !== 'blob' || attempt >= 4) throw e;
+        const { BlobPreconditionFailedError } = await sdk();
+        if (!(e instanceof BlobPreconditionFailedError)) {
+          if (dbEtag) throw e; // a real error, not a race
+          await loadDb(); // first write failed: maybe someone created the file meanwhile
+          if (!dbEtag) throw e;
+        } else {
+          await loadDb();
+        }
+      }
+    }
   });
-  return saving;
+}
+
+// Find a file entry; with a shared Blob db another instance may have added it since we last looked.
+async function lookupFile(id) {
+  if (db.files[id]) return db.files[id];
+  if (cfg.dbStore === 'blob' && Date.now() - lastReload > 5000) {
+    try {
+      await enqueue(loadDb);
+    } catch (e) {
+      log('db reload failed:', e.message);
+    }
+  }
+  return db.files[id];
 }
 
 /* ------------------------------------------------------ discord backend */
@@ -212,9 +280,69 @@ async function localRemove(meta) {
   await fsp.unlink(path.join(filesDir, `${meta.id}.mp3`)).catch(() => {});
 }
 
+/* -------------------------------------------------------- blob backend */
+
+// Vercel Blob via the official SDK (the only dependency, loaded only for STORAGE=blob).
+// Credentials are resolved by the SDK itself from the environment:
+//   1. OIDC: BLOB_STORE_ID + VERCEL_OIDC_TOKEN (only exists on Vercel / after `vercel env pull`)
+//   2. BLOB_READ_WRITE_TOKEN (works anywhere)
+// BLOB_WEBHOOK_PUBLIC_KEY is only used for presigned *client* uploads; this relay uploads server-side.
+let blobSdk;
+async function sdk() {
+  if (!blobSdk) {
+    try {
+      blobSdk = await import('@vercel/blob');
+    } catch {
+      throw new Error('STORAGE=blob needs the SDK: run "npm install"');
+    }
+  }
+  return blobSdk;
+}
+
+async function blobPut(id, buf) {
+  const { put } = await sdk();
+  const blob = await put(`impr/${id}.mp3`, buf, {
+    access: cfg.blobAccess,
+    contentType: 'audio/mpeg',
+    addRandomSuffix: false,
+  });
+  return { pathname: blob.pathname };
+}
+
+async function blobStream(meta, req, res) {
+  const { get } = await sdk();
+  const headers = {};
+  if (req.headers.range) headers.range = req.headers.range;
+
+  const r = await get(meta.pathname, { access: cfg.blobAccess, headers });
+  if (!r || !r.stream) return fail(res, 404, 'Not found', 'File is no longer available');
+
+  // The SDK reports every successful response as 200, so detect partial content by the header.
+  const contentRange = r.headers.get('content-range');
+  const out = { 'content-type': 'audio/mpeg', 'accept-ranges': 'bytes', 'cache-control': 'public, max-age=3600' };
+  const len = r.headers.get('content-length');
+  if (len) out['content-length'] = len;
+  if (contentRange) out['content-range'] = contentRange;
+  res.writeHead(contentRange ? 206 : 200, out);
+
+  if (req.method === 'HEAD') {
+    await r.stream.cancel().catch(() => {});
+    return res.end();
+  }
+  const body = Readable.fromWeb(r.stream);
+  res.on('close', () => body.destroy());
+  return pipeline(body, res).catch(() => {});
+}
+
+async function blobRemove(meta) {
+  const { del } = await sdk();
+  await del(meta.pathname);
+}
+
 const storages = {
   discord: { put: discordPut, stream: discordStream, remove: discordRemove },
   local: { put: localPut, stream: localStream, remove: localRemove },
+  blob: { put: blobPut, stream: blobStream, remove: blobRemove },
 };
 const storage = storages[cfg.storage];
 
@@ -242,7 +370,8 @@ function clientIp(req) {
 
 function baseUrl(req) {
   if (cfg.publicUrl) return cfg.publicUrl;
-  const proto = cfg.trustProxy && req.headers['x-forwarded-proto'] ? req.headers['x-forwarded-proto'] : 'http';
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const proto = forwardedProto || (req.socket && req.socket.encrypted ? 'https' : 'https');
   return `${proto}://${req.headers.host}/`;
 }
 
@@ -323,11 +452,14 @@ async function handleUpload(req, res) {
   let id = db.hashes[hash];
   if (!id || !db.files[id]) {
     id = crypto.randomBytes(9).toString('base64url');
+    const fileId = id;
     try {
-      const meta = await storage.put(id, buf);
-      db.files[id] = { id, ...meta, size: buf.length, created: Date.now(), uuid };
-      db.hashes[hash] = id;
-      await saveDb();
+      const meta = await storage.put(fileId, buf);
+      const entry = { id: fileId, ...meta, size: buf.length, created: Date.now(), uuid };
+      await mutateDb((d) => {
+        d.files[fileId] = entry;
+        d.hashes[hash] = fileId;
+      });
     } catch (e) {
       log('upload failed:', e.message);
       return fail(res, 502, 'Storage error', 'There was a problem processing the upload, please try again later');
@@ -338,7 +470,7 @@ async function handleUpload(req, res) {
 }
 
 async function handleFile(req, res, id) {
-  const meta = db.files[id];
+  const meta = await lookupFile(id);
   if (!meta) return fail(res, 404, 'Not found', 'Unknown file');
   return storage.stream(meta, req, res);
 }
@@ -367,37 +499,66 @@ async function cleanup() {
   if (!cfg.retentionDays) return;
 
   const cutoff = now - cfg.retentionDays * 86_400_000;
-  let removed = 0;
-  for (const [id, meta] of Object.entries(db.files)) {
-    if (meta.created >= cutoff) continue;
+  const stale = Object.values(db.files).filter((m) => m.created < cutoff);
+  for (const meta of stale) {
     try {
       await storage.remove(meta);
     } catch (e) {
-      log('remove failed:', id, e.message);
+      log('remove failed:', meta.id, e.message);
     }
-    delete db.files[id];
-    urlCache.delete(id);
-    for (const [h, hid] of Object.entries(db.hashes)) if (hid === id) delete db.hashes[h];
-    removed++;
+    urlCache.delete(meta.id);
   }
-  if (removed) {
-    await saveDb();
-    log(`retention: removed ${removed} file(s)`);
+  if (stale.length) {
+    await mutateDb((d) => {
+      for (const meta of stale) {
+        delete d.files[meta.id];
+        for (const [h, hid] of Object.entries(d.hashes)) if (hid === meta.id) delete d.hashes[h];
+      }
+    });
+    log(`retention: removed ${stale.length} file(s)`);
   }
 }
 
-(async () => {
-  if (!storage) {
-    console.error(`Unknown STORAGE "${cfg.storage}" (use "discord" or "local")`);
-    process.exit(1);
-  }
+async function initialize() {
+  if (!storage) throw new Error(`Unknown STORAGE "${cfg.storage}" (use "discord", "blob" or "local")`);
+  if (!['file', 'blob'].includes(cfg.dbStore)) throw new Error(`Unknown DB_STORE "${cfg.dbStore}" (use "file" or "blob")`);
   if (cfg.storage === 'discord' && !/^https:\/\/(\w+\.)?discord(app)?\.com\/api\/webhooks\//.test(cfg.webhook)) {
-    console.error('STORAGE=discord needs a valid DISCORD_WEBHOOK_URL');
-    process.exit(1);
+    throw new Error('STORAGE=discord needs a valid DISCORD_WEBHOOK_URL');
   }
+
+  const usesBlob = cfg.storage === 'blob' || cfg.dbStore === 'blob';
+  if (usesBlob) {
+    const why = cfg.dbStore === 'blob' ? 'DB_STORE=blob' : 'STORAGE=blob';
+    if (!['private', 'public'].includes(cfg.blobAccess)) throw new Error('BLOB_ACCESS must be "private" or "public" (it has to match your Blob store)');
+    const hasToken = !!process.env.BLOB_READ_WRITE_TOKEN;
+    const hasOidc = !!(process.env.BLOB_STORE_ID && process.env.VERCEL_OIDC_TOKEN);
+    if (!hasToken && !hasOidc) throw new Error(`${why} needs BLOB_READ_WRITE_TOKEN (or Vercel OIDC credentials).`);
+    await sdk();
+    if (cfg.dbStore === 'blob' && cfg.blobAccess === 'public') {
+      log('WARNING: DB_STORE=blob with a public store makes files.json (player UUIDs) readable by anyone with the URL. Use a private store.');
+    }
+  }
+
+  if (cfg.storage === 'local' || cfg.dbStore === 'file') await fsp.mkdir(filesDir, { recursive: true });
   await loadDb();
   setInterval(() => cleanup().catch((e) => log('cleanup error:', e)), 3_600_000).unref();
-  server.listen(cfg.port, () =>
-    log(`${cfg.name} v${VERSION} listening on :${cfg.port} (storage=${cfg.storage}, max=${cfg.maxFileSize} bytes)`)
-  );
-})();
+  log(`${cfg.name} v${VERSION} initialized (files=${cfg.storage}, db=${cfg.dbStore}, ${Object.keys(db.files).length} known, max=${cfg.maxFileSize} bytes)`);
+}
+
+// Initialize once per warm serverless instance and dispatch requests through the same routes.
+const ready = initialize();
+module.exports = async function handler(req, res) {
+  try {
+    await ready;
+    server.emit('request', req, res);
+  } catch (e) {
+    log('initialization/request error:', e.message);
+    if (!res.headersSent) fail(res, 500, 'Relay initialization failed', e.message);
+    else res.destroy();
+  }
+};
+
+if (require.main === module) {
+  ready.then(() => server.listen(cfg.port, () => log(`${cfg.name} v${VERSION} listening on :${cfg.port}`)))
+    .catch((e) => { console.error(`Relay initialization failed: ${e.message}`); process.exitCode = 1; });
+}

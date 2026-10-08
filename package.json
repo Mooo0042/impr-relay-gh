@@ -1,13 +1,11 @@
 {
   "name": "impr-relay",
-  "version": "1.0.0",
-  "description": "Upload relay for the IamMusicPlayer(Renewed) Minecraft mod",
-  "main": "server.js",
-  "scripts": {
-    "start": "node --env-file=.env server.js"
-  },
+  "version": "1.2.2",
+  "private": true,
   "engines": {
-    "node": ">=20.6"
+    "node": ">=20"
   },
-  "license": "MIT"
+  "dependencies": {
+    "@vercel/blob": "^2.0.0"
+  }
 }
