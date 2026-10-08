@@ -1,0 +1,13 @@
+{
+  "name": "impr-relay",
+  "version": "1.0.0",
+  "description": "Upload relay for the IamMusicPlayer(Renewed) Minecraft mod",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --env-file=.env server.js"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "license": "MIT"
+}
