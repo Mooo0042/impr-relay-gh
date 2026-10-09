@@ -1,18 +1,10 @@
 {
   "version": 2,
   "functions": {
-    "api/[...route].js": {
-      "maxDuration": 60
-    }
+    "api/[...route].js": { "maxDuration": 60, "memory": 1024 }
   },
   "rewrites": [
-    {
-      "source": "/",
-      "destination": "/api/index"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/api/$1"
-    }
+    { "source": "/", "destination": "/api/index" },
+    { "source": "/(.*)", "destination": "/api/$1" }
   ]
 }

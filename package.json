@@ -1,11 +1,7 @@
 {
   "name": "impr-relay",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
-  "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "@vercel/blob": "^2.0.0"
-  }
+  "engines": { "node": ">=20" },
+  "dependencies": { "@vercel/blob": "^2.0.0" }
 }

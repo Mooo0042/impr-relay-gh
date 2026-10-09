@@ -370,8 +370,7 @@ function clientIp(req) {
 
 function baseUrl(req) {
   if (cfg.publicUrl) return cfg.publicUrl;
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  const proto = forwardedProto || (req.socket && req.socket.encrypted ? 'https' : 'https');
+  const proto = req.headers['x-forwarded-proto'] || (process.env.VERCEL ? 'https' : 'http');
   return `${proto}://${req.headers.host}/`;
 }
 
@@ -475,7 +474,7 @@ async function handleFile(req, res, id) {
   return storage.stream(meta, req, res);
 }
 
-const server = http.createServer(async (req, res) => {
+const handleRequest = async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
@@ -491,7 +490,7 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) fail(res, 500, 'Internal error', 'Unexpected server error');
     else res.destroy();
   }
-});
+};
 
 async function cleanup() {
   const now = Date.now();
@@ -532,7 +531,7 @@ async function initialize() {
     if (!['private', 'public'].includes(cfg.blobAccess)) throw new Error('BLOB_ACCESS must be "private" or "public" (it has to match your Blob store)');
     const hasToken = !!process.env.BLOB_READ_WRITE_TOKEN;
     const hasOidc = !!(process.env.BLOB_STORE_ID && process.env.VERCEL_OIDC_TOKEN);
-    if (!hasToken && !hasOidc) throw new Error(`${why} needs BLOB_READ_WRITE_TOKEN (or Vercel OIDC credentials).`);
+    if (!hasToken && !hasOidc) throw new Error(`${why} needs BLOB_READ_WRITE_TOKEN (or BLOB_STORE_ID + VERCEL_OIDC_TOKEN when running on Vercel).`);
     await sdk();
     if (cfg.dbStore === 'blob' && cfg.blobAccess === 'public') {
       log('WARNING: DB_STORE=blob with a public store makes files.json (player UUIDs) readable by anyone with the URL. Use a private store.');
@@ -541,24 +540,30 @@ async function initialize() {
 
   if (cfg.storage === 'local' || cfg.dbStore === 'file') await fsp.mkdir(filesDir, { recursive: true });
   await loadDb();
-  setInterval(() => cleanup().catch((e) => log('cleanup error:', e)), 3_600_000).unref();
+  if (!process.env.VERCEL) setInterval(() => cleanup().catch((e) => log('cleanup error:', e)), 3_600_000).unref();
   log(`${cfg.name} v${VERSION} initialized (files=${cfg.storage}, db=${cfg.dbStore}, ${Object.keys(db.files).length} known, max=${cfg.maxFileSize} bytes)`);
 }
 
-// Initialize once per warm serverless instance and dispatch requests through the same routes.
-const ready = initialize();
-module.exports = async function handler(req, res) {
+const initialized = initialize();
+
+async function handler(req, res) {
   try {
-    await ready;
-    server.emit('request', req, res);
+    await initialized;
+    await handleRequest(req, res);
   } catch (e) {
-    log('initialization/request error:', e.message);
-    if (!res.headersSent) fail(res, 500, 'Relay initialization failed', e.message);
+    log('initialization/request error:', e && e.stack || e);
+    if (!res.headersSent) fail(res, 500, 'Relay initialization error', String(e && e.message || e));
     else res.destroy();
   }
-};
+}
+
+module.exports = handler;
 
 if (require.main === module) {
-  ready.then(() => server.listen(cfg.port, () => log(`${cfg.name} v${VERSION} listening on :${cfg.port}`)))
-    .catch((e) => { console.error(`Relay initialization failed: ${e.message}`); process.exitCode = 1; });
+  initialized.then(() => {
+    http.createServer(handler).listen(cfg.port, () => log(`${cfg.name} v${VERSION} listening on :${cfg.port}`));
+  }).catch((e) => {
+    console.error('Relay startup failed:', e && e.stack || e);
+    process.exitCode = 1;
+  });
 }
