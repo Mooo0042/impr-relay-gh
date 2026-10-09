@@ -1,0 +1,35 @@
+services:
+  impr-relay:
+    build: .
+    container_name: impr-relay
+    restart: unless-stopped
+    init: true
+    environment:
+      PORT: "3009"
+      RELAY_NAME: "IMPR Relay"
+      # Set this to the public HTTPS URL that players will use, including trailing slash.
+      # Example: https://impr-relay.your-tailnet.ts.net/
+      PUBLIC_URL: "https://CHANGE-ME.ts.net/"
+      TRUST_PROXY: "1"
+      STORAGE: "local"
+      DB_STORE: "file"
+      DATA_DIR: "/data"
+      MAX_FILE_SIZE: "52428800"
+      RATE_LIMIT_PER_HOUR: "20"
+      RETENTION_DAYS: "0"
+      # Optional: comma-separated Minecraft UUIDs allowed to upload. Blank allows any UUID.
+      ALLOWED_UUIDS: ""
+    ports:
+      - "3009:3009"
+    volumes:
+      - impr-relay-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  impr-relay-data:

@@ -370,7 +370,7 @@ function clientIp(req) {
 
 function baseUrl(req) {
   if (cfg.publicUrl) return cfg.publicUrl;
-  const proto = req.headers['x-forwarded-proto'] || (process.env.VERCEL ? 'https' : 'http');
+  const proto = cfg.trustProxy && req.headers['x-forwarded-proto'] ? req.headers['x-forwarded-proto'] : 'http';
   return `${proto}://${req.headers.host}/`;
 }
 
@@ -474,7 +474,7 @@ async function handleFile(req, res, id) {
   return storage.stream(meta, req, res);
 }
 
-const handleRequest = async (req, res) => {
+const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
@@ -490,7 +490,7 @@ const handleRequest = async (req, res) => {
     if (!res.headersSent) fail(res, 500, 'Internal error', 'Unexpected server error');
     else res.destroy();
   }
-};
+});
 
 async function cleanup() {
   const now = Date.now();
@@ -518,52 +518,60 @@ async function cleanup() {
   }
 }
 
-async function initialize() {
-  if (!storage) throw new Error(`Unknown STORAGE "${cfg.storage}" (use "discord", "blob" or "local")`);
-  if (!['file', 'blob'].includes(cfg.dbStore)) throw new Error(`Unknown DB_STORE "${cfg.dbStore}" (use "file" or "blob")`);
+(async () => {
+  if (!storage) {
+    console.error(`Unknown STORAGE "${cfg.storage}" (use "discord", "blob" or "local")`);
+    process.exit(1);
+  }
+  if (!['file', 'blob'].includes(cfg.dbStore)) {
+    console.error(`Unknown DB_STORE "${cfg.dbStore}" (use "file" or "blob")`);
+    process.exit(1);
+  }
   if (cfg.storage === 'discord' && !/^https:\/\/(\w+\.)?discord(app)?\.com\/api\/webhooks\//.test(cfg.webhook)) {
-    throw new Error('STORAGE=discord needs a valid DISCORD_WEBHOOK_URL');
+    console.error('STORAGE=discord needs a valid DISCORD_WEBHOOK_URL');
+    process.exit(1);
   }
 
   const usesBlob = cfg.storage === 'blob' || cfg.dbStore === 'blob';
   if (usesBlob) {
     const why = cfg.dbStore === 'blob' ? 'DB_STORE=blob' : 'STORAGE=blob';
-    if (!['private', 'public'].includes(cfg.blobAccess)) throw new Error('BLOB_ACCESS must be "private" or "public" (it has to match your Blob store)');
+    if (!['private', 'public'].includes(cfg.blobAccess)) {
+      console.error('BLOB_ACCESS must be "private" or "public" (it has to match your Blob store)');
+      process.exit(1);
+    }
     const hasToken = !!process.env.BLOB_READ_WRITE_TOKEN;
     const hasOidc = !!(process.env.BLOB_STORE_ID && process.env.VERCEL_OIDC_TOKEN);
-    if (!hasToken && !hasOidc) throw new Error(`${why} needs BLOB_READ_WRITE_TOKEN (or BLOB_STORE_ID + VERCEL_OIDC_TOKEN when running on Vercel).`);
-    await sdk();
+    if (!hasToken && !hasOidc) {
+      console.error(
+        `${why} needs BLOB_READ_WRITE_TOKEN (or BLOB_STORE_ID + VERCEL_OIDC_TOKEN when running on Vercel).\n` +
+          'BLOB_STORE_ID alone is not enough: outside Vercel there is no OIDC token to pair it with.'
+      );
+      process.exit(1);
+    }
+    try {
+      await sdk();
+    } catch (e) {
+      console.error(e.message);
+      process.exit(1);
+    }
     if (cfg.dbStore === 'blob' && cfg.blobAccess === 'public') {
       log('WARNING: DB_STORE=blob with a public store makes files.json (player UUIDs) readable by anyone with the URL. Use a private store.');
     }
   }
 
-  if (cfg.storage === 'local' || cfg.dbStore === 'file') await fsp.mkdir(filesDir, { recursive: true });
-  await loadDb();
-  if (!process.env.VERCEL) setInterval(() => cleanup().catch((e) => log('cleanup error:', e)), 3_600_000).unref();
-  log(`${cfg.name} v${VERSION} initialized (files=${cfg.storage}, db=${cfg.dbStore}, ${Object.keys(db.files).length} known, max=${cfg.maxFileSize} bytes)`);
-}
-
-const initialized = initialize();
-
-async function handler(req, res) {
   try {
-    await initialized;
-    await handleRequest(req, res);
+    if (cfg.storage === 'local' || cfg.dbStore === 'file') await fsp.mkdir(filesDir, { recursive: true });
+    await loadDb();
   } catch (e) {
-    log('initialization/request error:', e && e.stack || e);
-    if (!res.headersSent) fail(res, 500, 'Relay initialization error', String(e && e.message || e));
-    else res.destroy();
+    console.error(`Could not load the database (${cfg.dbStore}): ${e.message}`);
+    process.exit(1);
   }
-}
 
-module.exports = handler;
-
-if (require.main === module) {
-  initialized.then(() => {
-    http.createServer(handler).listen(cfg.port, () => log(`${cfg.name} v${VERSION} listening on :${cfg.port}`));
-  }).catch((e) => {
-    console.error('Relay startup failed:', e && e.stack || e);
-    process.exitCode = 1;
-  });
-}
+  setInterval(() => cleanup().catch((e) => log('cleanup error:', e)), 3_600_000).unref();
+  server.listen(cfg.port, () =>
+    log(
+      `${cfg.name} v${VERSION} listening on :${cfg.port} (files=${cfg.storage}, db=${cfg.dbStore}, ` +
+        `${Object.keys(db.files).length} known, max=${cfg.maxFileSize} bytes)`
+    )
+  );
+})();

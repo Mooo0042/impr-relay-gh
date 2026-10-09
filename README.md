@@ -4,7 +4,6 @@ A drop-in upload relay for **IamMusicPlayer / IamMusicPlayerRenewed (IMPR)**, th
 
 In the mod's Music Manager, a player picks a local MP3. The client sends it to a relay, which stores it and returns a URL the mod then streams from. The original relay was a single hosted service that is no longer running. This is a self-hostable replacement.
 
-- Zero dependencies, one file (`server.js`), Node 20.6+
 - Stores files on **Discord** (via webhook) or on **local disk**
 - Range requests supported, so seeking in the mod works
 - Rate limits, size limit, MP3 check, dedupe, optional allowlist and retention
@@ -12,8 +11,8 @@ In the mod's Music Manager, a player picks a local MP3. The client sends it to a
 ## Quick start
 
 ```sh
-cp .env.example .env     # set DISCORD_WEBHOOK_URL and PUBLIC_URL
-npm start                # runs: node --env-file=.env server.js
+nano compose.yaml    # set DISCORD_WEBHOOK_URL and PUBLIC_URL
+docker compose up -d --build
 ```
 
 Check it works:
@@ -76,38 +75,6 @@ All settings are environment variables (see `.env.example`).
 | `GET /f/<id>.mp3` | Serves the file. Supports `Range` and `HEAD` |
 
 Error responses use HTTP status codes 400, 403, 413, 415, 429 and 502 together with the `Error`/`Message` JSON the client displays.
-
-## Deployment
-
-### Reverse proxy (Caddy)
-
-```
-relay.example.com {
-    request_body {
-        max_size 9MB
-    }
-    reverse_proxy localhost:3009
-}
-```
-
-With nginx, set `client_max_body_size` to at least `MAX_FILE_SIZE`. Set `TRUST_PROXY=1` and `PUBLIC_URL=https://relay.example.com/` in `.env`.
-
-### systemd
-
-```ini
-[Unit]
-Description=IMPR relay
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/impr-relay
-ExecStart=/usr/bin/node --env-file=/opt/impr-relay/.env server.js
-Restart=on-failure
-User=impr
-
-[Install]
-WantedBy=multi-user.target
-```
 
 ## Notes and limits
 
